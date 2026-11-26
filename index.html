@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<title>Lyric constellation</title>
+<style>
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;margin:0;background:#000;color:#f1e6d0;font-family:"Avenir Next","Helvetica Neue","Segoe UI",system-ui,sans-serif}
+#setup{max-width:34rem;margin:0 auto;padding:12vh 1.5rem 3rem}
+#setup h1{font-size:1.6rem;margin:0 0 1.25rem;letter-spacing:-.01em}
+#setup ol{padding-left:1.2rem;line-height:1.65;margin:0 0 1.25rem}
+code{background:#1a0a08;border:1px solid #3a1511;padding:.1em .4em;border-radius:3px;word-break:break-all}
+input{width:100%;padding:.7rem .8rem;background:#0c0605;border:1px solid #4a1b15;color:inherit;border-radius:4px;font:inherit;margin:.4rem 0 1rem}
+button{padding:.7rem 1.2rem;background:#1a0504;color:#ffd27a;border:1px solid #ff2a1a;border-radius:4px;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 0 14px rgba(255,42,26,.45)}
+.err{color:#ff6b5a;min-height:1.4em;margin:.2rem 0 1rem}
+#scene{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
+#stage{position:relative;width:86vw;height:74vh;border:2px solid #ff2a1a;border-radius:3px;background:radial-gradient(ellipse at 50% 45%,#120403,#000 70%);box-shadow:0 0 30px rgba(255,42,26,.6),inset 0 0 70px rgba(255,42,26,.28)}
+#cv{position:absolute;inset:0;width:100%;height:100%}
+#now{position:absolute;left:2.5%;bottom:5%;display:flex;gap:.8rem;align-items:flex-end;max-width:60%}
+#art{width:min(13vw,18vh);aspect-ratio:1;object-fit:cover;border:1px solid #ff2a1a;box-shadow:0 0 18px rgba(255,42,26,.55)}
+#meta{font-size:.85rem;line-height:1.35;color:#c79a4a}
+#meta b{display:block;color:#ffd27a;font-size:1rem}
+#note{position:fixed;left:0;right:0;bottom:1.2vh;text-align:center;font-size:.8rem;color:#8a6a55}
+#note a{color:inherit;cursor:pointer;text-decoration:underline}
+@media (max-aspect-ratio:1/1){#stage{width:92vw;height:80vh}#art{width:min(24vw,16vh)}#meta{font-size:.78rem}#meta b{font-size:.9rem}}
+</style>
+</head>
+<body>
+<main id="setup" hidden>
+  <h1>Connect Spotify</h1>
+  <ol>
+    <li>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener" style="color:#ffd27a">Spotify developer dashboard</a> and create an app.</li>
+    <li>Add this redirect URI to the app: <code id="redirect"></code></li>
+    <li>Paste the app’s Client ID below.</li>
+  </ol>
+  <p class="err" id="hostwarn" hidden>Open this page over https (for example your GitHub Pages address). Spotify only accepts https redirects.</p>
+  <label for="cid">Client ID</label>
+  <input id="cid" autocomplete="off" spellcheck="false">
+  <p class="err" id="seterr"></p>
+  <button id="connect">Connect Spotify</button>
+</main>
+
+<div id="scene" hidden>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="now"><img id="art" alt=""><div id="meta"></div></div>
+  </div>
+  <p id="note"></p>
+</div>
+
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const REDIRECT = location.origin + location.pathname;
+const SCOPES = 'user-read-currently-playing user-read-playback-state';
+const store = {
+  get: k => localStorage.getItem('lc_' + k),
+  set: (k, v) => localStorage.setItem('lc_' + k, v),
+  del: k => localStorage.removeItem('lc_' + k),
+};
+
+/* ---------- Spotify sign-in (PKCE, no secret, no server) ---------- */
+const rand = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => b.toString(16).padStart(2, '0')).join('');
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function login() {
+  const verifier = rand(32), state = rand(8);
+  store.set('verifier', verifier); store.set('state', state);
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  location.href = 'https://accounts.spotify.com/authorize?' + new URLSearchParams({
+    client_id: store.get('cid'), response_type: 'code', redirect_uri: REDIRECT, scope: SCOPES,
+    code_challenge_method: 'S256', code_challenge: challenge, state,
+  });
+}
+async function tokenReq(params) {
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(params),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error_description || j.error || r.status);
+  store.set('access', j.access_token);
+  store.set('exp', String(Date.now() + j.expires_in * 1000));
+  if (j.refresh_token) store.set('refresh', j.refresh_token);
+}
+async function token() {
+  if (Date.now() > Number(store.get('exp') || 0) - 30000)
+    await tokenReq({ client_id: store.get('cid'), grant_type: 'refresh_token', refresh_token: store.get('refresh') });
+  return store.get('access');
+}
+function disconnect(msg) {
+  ['access', 'exp', 'refresh'].forEach(store.del);
+  location.href = location.pathname + (msg ? '?msg=' + encodeURIComponent(msg) : '');
+}
+function showSetup(msg) {
+  $('setup').hidden = false; $('scene').hidden = true;
+  $('redirect').textContent = REDIRECT;
+  $('hostwarn').hidden = location.protocol === 'https:' || location.hostname === '127.0.0.1';
+  $('cid').value = store.get('cid') || '';
+  $('seterr').textContent = msg || '';
+}
+$('connect').onclick = () => {
+  const v = $('cid').value.trim();
+  if (!/^[0-9a-f]{32}$/i.test(v)) { $('seterr').textContent = 'Paste the 32-character Client ID from your Spotify app.'; return; }
+  store.set('cid', v); login();
+};
+
+async function boot() {
+  const p = new URLSearchParams(location.search);
+  history.replaceState({}, '', location.pathname);
+  if (p.get('msg')) return showSetup(p.get('msg'));
+  if (p.get('error')) return showSetup('Spotify returned “' + p.get('error') + '”. Connect again.');
+  if (p.get('code')) {
+    if (p.get('state') !== store.get('state')) return showSetup('Sign-in could not be verified. Connect again.');
+    try {
+      await tokenReq({ client_id: store.get('cid'), grant_type: 'authorization_code', code: p.get('code'), redirect_uri: REDIRECT, code_verifier: store.get('verifier') });
+    } catch (e) { return showSetup('Sign-in failed: ' + e.message); }
+  }
+  store.get('refresh') ? startScene() : showSetup();
+}
+
+/* ---------- Now playing + lyrics ---------- */
+let cur = null;           // {id, progress, at, playing, duration}
+let lines = [];           // [{t, words:[]}]
+let synced = true;
+
+const cleanWords = s => s.toLowerCase().replace(/[^\p{L}\p{N}'’\s-]/gu, ' ').split(/\s+/).filter(Boolean);
+
+async function loadLyrics(item) {
+  const id = item.id;
+  const q = new URLSearchParams({ track_name: item.name, artist_name: item.artists[0].name, album_name: item.album.name, duration: Math.round(item.duration_ms / 1000) });
+  let j = null;
+  try {
+    let r = await fetch('https://lrclib.net/api/get?' + q);
+    if (r.ok) j = await r.json();
+    else {
+      r = await fetch('https://lrclib.net/api/search?' + new URLSearchParams({ track_name: item.name, artist_name: item.artists[0].name }));
+      const list = r.ok ? await r.json() : [];
+      j = list.find(x => x.syncedLyrics) || list.find(x => x.plainLyrics) || null;
+    }
+  } catch (e) { /* offline: fall through to title words */ }
+  if (!cur || cur.id !== id) return;
+  const out = [];
+  if (j && j.syncedLyrics) {
+    synced = true;
+    for (const row of j.syncedLyrics.split('\n')) {
+      const m = row.match(/^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/);
+      if (m && m[3].trim()) out.push({ t: (+m[1] * 60 + +m[2]) * 1000, words: cleanWords(m[3]) });
+    }
+  } else if (j && j.plainLyrics) {
+    synced = false;
+    const rows = j.plainLyrics.split('\n').filter(s => s.trim());
+    rows.forEach((s, i) => out.push({ t: i * item.duration_ms / rows.length, words: cleanWords(s) }));
+  }
+  lines = out.filter(l => l.words.length);
+  $('note').innerHTML = lines.length
+    ? (synced ? '' : 'No timed lyrics for this song. Words are spread evenly across it. ') + '<a id="dc">Disconnect</a>'
+    : 'No lyrics found for this song. Showing its title. <a id="dc">Disconnect</a>';
+  if (!lines.length) lines = [{ t: 0, words: cleanWords(item.name + ' ' + item.artists[0].name) }];
+  $('dc').onclick = () => disconnect();
+  resetNodes();
+}
+
+function handle(d) {
+  const item = d && d.item;
+  if (!item || d.currently_playing_type !== 'track') { cur = null; lines = []; resetNodes(); $('meta').innerHTML = ''; $('art').hidden = true; $('note').textContent = 'Play a song in Spotify to start.'; return; }
+  const changed = !cur || cur.id !== item.id;
+  cur = { id: item.id, progress: d.progress_ms, at: performance.now(), playing: d.is_playing, duration: item.duration_ms };
+  if (changed) {
+    lines = []; resetNodes();
+    $('art').hidden = false; $('art').src = item.album.images[0].url;
+    $('meta').innerHTML = '<b></b><span></span>';
+    $('meta').firstChild.textContent = item.name;
+    $('meta').lastChild.textContent = item.artists.map(a => a.name).join(', ');
+    loadLyrics(item);
+  }
+}
+async function poll() {
+  let wait = 3000;
+  try {
+    const r = await fetch('https://api.spotify.com/v1/me/player/currently-playing', { headers: { Authorization: 'Bearer ' + await token() } });
+    if (r.status === 204) handle(null);
+    else if (r.status === 401) return disconnect('Spotify session expired. Connect again.');
+    else if (r.status === 429) wait = (+r.headers.get('Retry-After') || 5) * 1000;
+    else if (r.ok) handle(await r.json());
+  } catch (e) {
+    if (/invalid_grant|refresh/i.test(e.message)) return disconnect('Spotify session expired. Connect again.');
+    $('note').textContent = 'Can’t reach Spotify. Retrying…';
+  }
+  setTimeout(poll, wait);
+}
+const position = () => cur ? cur.progress + (cur.playing ? performance.now() - cur.at : 0) : 0;
+
+/* ---------- Constellation ---------- */
+const cv = $('cv'), ctx = cv.getContext('2d');
+let W = 0, H = 0, nodes = [], active = -1, lastNode = null;
+const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const fsz = () => Math.max(13, Math.min(30, W < 600 ? W * 0.05 : W * 0.026));
+
+function resize() {
+  const dpr = devicePixelRatio || 1, b = cv.getBoundingClientRect();
+  W = b.width; H = b.height; cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+new ResizeObserver(resize).observe(cv);
+function resetNodes() { nodes = []; active = -1; lastNode = null; }
+
+function spawn(i, now) {
+  const fs = fsz(); ctx.font = '700 ' + fs + 'px "Avenir Next","Helvetica Neue","Segoe UI",sans-serif';
+  let x = W * (0.14 + Math.random() * 0.4), y = H * (0.18 + Math.random() * 0.55);
+  let dir = x > W * 0.5 ? -1 : 1, prev = null, first = null;
+  lines[i].words.forEach((w, k) => {
+    const wid = ctx.measureText(w).width;
+    if (prev) {
+      x += dir * (prev.wid / 2 + wid / 2 + fs * 1.6);
+      y += (Math.random() - 0.5) * fs * 3;
+      if (x < W * 0.08 || x > W * 0.92) { dir = -dir; x = Math.max(W * 0.1, Math.min(W * 0.9, x)); y += fs * 3.2; }
+    }
+    y = Math.max(H * 0.1, Math.min(H * 0.84, y));
+    const n = { w, wid, x, y, fs, born: now, line: i, k, prev: prev || lastNode, cross: !prev && !!lastNode };
+    nodes.push(n); prev = n; first = first || n;
+  });
+  lastNode = prev;
+  if (nodes.length > 140) nodes.splice(0, nodes.length - 140);
+}
+
+function frame(now) {
+  const pos = position();
+  if (lines.length) {
+    let i = -1;
+    for (let k = 0; k < lines.length && lines[k].t <= pos; k++) i = k;
+    if (i !== active) {
+      if (i >= 0) { if (Math.abs(i - active) > 1) { nodes = []; lastNode = null; } spawn(i, now); }
+      active = i;
+    }
+  }
+  ctx.clearRect(0, 0, W, H);
+  nodes = nodes.filter(n => now - n.born < 22000 || n.line === active);
+  const alive = new Set(nodes);
+  const A = n => n.line === active ? 1 : Math.pow(Math.max(0, 1 - (now - n.born) / 18000), 1.4);
+
+  // links
+  ctx.lineWidth = 1;
+  for (const n of nodes) {
+    if (!n.prev || !alive.has(n.prev)) continue;
+    const a = Math.min(A(n), A(n.prev)) * (n.cross ? 0.22 : 0.5);
+    if (a < 0.02) continue;
+    ctx.strokeStyle = 'rgba(224,169,59,' + a + ')';
+    ctx.setLineDash(n.cross ? [3, 6] : []);
+    ctx.beginPath(); ctx.moveTo(n.prev.x, n.prev.y + n.prev.fs * 0.8); ctx.lineTo(n.x, n.y + n.fs * 0.8); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // which word is being sung
+  let sung = -1;
+  if (active >= 0 && lines[active]) {
+    const L = lines[active], end = lines[active + 1] ? lines[active + 1].t : L.t + 4000;
+    sung = Math.min(L.words.length - 1, Math.floor(Math.max(0, (pos - L.t) / ((end - L.t) * 0.85)) * L.words.length));
+  }
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const n of nodes) {
+    const hot = n.line === active && n.k === sung, a = hot ? 1 : A(n) * (n.line === active ? 0.75 : 1);
+    if (a < 0.02) continue;
+    const s = hot ? 1.5 : 1;
+    ctx.globalAlpha = a;
+    ctx.font = '700 ' + n.fs * s + 'px "Avenir Next","Helvetica Neue","Segoe UI",sans-serif';
+    ctx.fillStyle = hot ? '#ffd98f' : '#d9a441';
+    ctx.shadowColor = hot ? 'rgba(255,190,80,.9)' : 'transparent'; ctx.shadowBlur = hot ? 18 : 0;
+    ctx.fillText(n.w, n.x, n.y);
+    ctx.shadowBlur = 0;
+    // point marker under the word
+    const px = n.x, py = n.y + n.fs * 0.8, r = hot ? 5 : 2.5;
+    ctx.strokeStyle = hot ? '#ff2a1a' : 'rgba(224,169,59,.9)'; ctx.lineWidth = hot ? 2 : 1;
+    if (hot) { ctx.shadowColor = '#ff2a1a'; ctx.shadowBlur = 14; }
+    ctx.beginPath(); ctx.moveTo(px - r, py); ctx.lineTo(px + r, py); ctx.moveTo(px, py - r); ctx.lineTo(px, py + r); ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  ctx.globalAlpha = 1;
+
+  // slow drift of the tilted frame
+  const t = still ? 0 : now;
+  $('stage').style.transform = 'perspective(1500px) rotateX(' + (6 + Math.sin(t / 7000) * 2) + 'deg) rotateY(' + (-12 + Math.sin(t / 9000) * 4) * (W < 600 ? 0.6 : 1) + 'deg) rotateZ(-1.5deg)';
+  requestAnimationFrame(frame);
+}
+
+function startScene() {
+  $('setup').hidden = true; $('scene').hidden = false;
+  $('art').hidden = true; $('note').textContent = 'Play a song in Spotify to start.';
+  resize(); poll(); requestAnimationFrame(frame);
+  if ('wakeLock' in navigator) {                     // keep the screen on while it is open
+    const lock = () => navigator.wakeLock.request('screen').catch(() => {});
+    lock(); document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && lock());
+  }
+  $('stage').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
+  addEventListener('keydown', e => { if (e.key === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); });
+}
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+boot();
+})();
+</script>
+</body>
+</html>
